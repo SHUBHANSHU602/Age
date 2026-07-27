@@ -3,7 +3,8 @@ const router = express.Router();
 const { embed } = require('../embedder');
 const { searchDense, searchSparse } = require('../vectorStore');
 const { chat } = require('../llm');
-const { buildVocabulary, computeSparseVector, tokenize } = require('../bm25');
+const { buildVocabulary, computeSparseVector } = require('../bm25');
+const { rerank } = require('../reranker');
 
 router.post('/', async (req, res) => {
   try {
@@ -14,17 +15,16 @@ router.post('/', async (req, res) => {
     if (trimmed.length < 3) return res.status(400).json({ error: 'question must be at least 3 characters' });
     if (trimmed.length > 1000) return res.status(400).json({ error: 'question too long — max 1000 characters' });
 
-    // Dense search — semantic meaning
+    // Step 1 — Dense semantic search
     const queryVec = await embed(trimmed);
-    const denseResults = await searchDense(queryVec, 8);
+    const denseResults = await searchDense(queryVec, 10);
 
-    // Sparse search — keyword matching
-    // Build vocab from query tokens only (approximate — good enough for retrieval)
+    // Step 2 — Sparse BM25 search
     const queryVocab = buildVocabulary([trimmed]);
     const sparseVec = computeSparseVector(trimmed, queryVocab);
-    const sparseResults = await searchSparse(sparseVec, 8);
+    const sparseResults = await searchSparse(sparseVec, 10);
 
-    // Merge: combine both result sets, deduplicate by id, keep highest score
+    // Step 3 — Merge both result sets, deduplicate by id
     const merged = new Map();
     for (const r of [...denseResults, ...sparseResults]) {
       if (!merged.has(r.id) || r.score > merged.get(r.id).score) {
@@ -32,28 +32,32 @@ router.post('/', async (req, res) => {
       }
     }
 
-    const filteredResults = Array.from(merged.values())
+    const candidates = Array.from(merged.values())
       .filter(r => r.score > 0.05)
       .sort((a, b) => b.score - a.score)
-      .slice(0, 8);
+      .slice(0, 10);
 
-    if (filteredResults.length === 0) {
+    if (candidates.length === 0) {
       return res.status(200).json({
         answer: 'I could not find relevant information to answer your question.',
         sources: [], retrieved: 0
       });
     }
 
-    // Deduplicate by parentIndex
+    // Step 4 — Rerank candidates with Cohere cross-encoder
+    const reranked = await rerank(trimmed, candidates, 4);
+
+    // Step 5 — Deduplicate by parentIndex
     const seenParents = new Map();
-    for (const result of filteredResults) {
+    for (const result of reranked) {
       const pIdx = result.payload.parentIndex ?? result.payload.chunkIndex;
-      if (!seenParents.has(pIdx) || result.score > seenParents.get(pIdx).score) {
+      if (!seenParents.has(pIdx) || result.rerankScore > seenParents.get(pIdx).rerankScore) {
         seenParents.set(pIdx, result);
       }
     }
     const dedupedResults = Array.from(seenParents.values());
 
+    // Step 6 — Build context from unique parents and generate answer
     const context = dedupedResults
       .map(r => r.payload.parentText || r.payload.text)
       .join('\n\n');
@@ -69,7 +73,7 @@ router.post('/', async (req, res) => {
       sources: dedupedResults.map(r => ({
         childText: r.payload.text,
         parentText: r.payload.parentText?.slice(0, 200) ?? null,
-        score: parseFloat(r.score.toFixed(4)),
+        rerankScore: parseFloat(r.rerankScore?.toFixed(4) ?? 0),
         parentIndex: r.payload.parentIndex ?? null,
         source: r.payload.source ?? null
       }))
