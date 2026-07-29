@@ -5,6 +5,7 @@ const { searchDense, searchSparse } = require('../vectorStore');
 const { chat } = require('../llm');
 const { buildVocabulary, computeSparseVector } = require('../bm25');
 const { rerank } = require('../reranker');
+const { reciprocalRankFusion } = require('../rrf');
 
 router.post('/', async (req, res) => {
   try {
@@ -24,25 +25,9 @@ router.post('/', async (req, res) => {
     const sparseVec = computeSparseVector(trimmed, queryVocab);
     const sparseResults = await searchSparse(sparseVec, 10);
 
-    // Step 3 — Merge both result sets, deduplicate by id
-    const merged = new Map();
-    for (const r of [...denseResults, ...sparseResults]) {
-      if (!merged.has(r.id) || r.score > merged.get(r.id).score) {
-        merged.set(r.id, r);
-      }
-    }
-
-    const candidates = Array.from(merged.values())
-      .filter(r => r.score > 0.05)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 10);
-
-    if (candidates.length === 0) {
-      return res.status(200).json({
-        answer: 'I could not find relevant information to answer your question.',
-        sources: [], retrieved: 0
-      });
-    }
+  //Step 3 — RRF fusion instead of raw score merge
+const candidates = reciprocalRankFusion([denseResults, sparseResults])
+  .slice(0, 10);
 
     // Step 4 — Rerank candidates with Cohere cross-encoder
     const reranked = await rerank(trimmed, candidates, 4);
