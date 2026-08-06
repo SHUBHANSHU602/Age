@@ -17,17 +17,14 @@ router.post('/', async (req, res) => {
     if (trimmed.length > 1000) return res.status(400).json({ error: 'question too long — max 1000 characters' });
 
     // Step 1 — Dense semantic search
-    const { hydeEmbed } = require('../hyde');
-    const queryVec = await hydeEmbed(trimmed);
-    const denseResults = await searchDense(queryVec, 10);
-
+    const denseResults = await multiQueryRetrieve(trimmed, 3, 5);
     // Step 2 — Sparse BM25 search
     const queryVocab = buildVocabulary([trimmed]);
     const sparseVec = computeSparseVector(trimmed, queryVocab);
     const sparseResults = await searchSparse(sparseVec, 10);
 
   //Step 3 — RRF fusion instead of raw score merge
-const candidates = reciprocalRankFusion([denseResults, sparseResults])
+  const candidates = reciprocalRankFusion([denseResults, sparseResults])
   .slice(0, 10);
 
     // Step 4 — Rerank candidates with Cohere cross-encoder
