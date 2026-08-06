@@ -1,47 +1,30 @@
 const express = require('express');
 const router = express.Router();
-const { embed } = require('../embedder');
-const { searchDense, searchSparse } = require('../vectorStore');
+const { retrieve } = require('../retrieval');
 const { chat } = require('../llm');
-const { buildVocabulary, computeSparseVector } = require('../bm25');
-const { rerank } = require('../reranker');
-const { reciprocalRankFusion } = require('../rrf');
 
 router.post('/', async (req, res) => {
   try {
     const { question } = req.body;
-    if (!question || typeof question !== 'string') return res.status(400).json({ error: 'question must be a non-empty string' });
+    if (!question || typeof question !== 'string') {
+      return res.status(400).json({ error: 'question must be a non-empty string' });
+    }
 
     const trimmed = question.trim();
     if (trimmed.length < 3) return res.status(400).json({ error: 'question must be at least 3 characters' });
     if (trimmed.length > 1000) return res.status(400).json({ error: 'question too long — max 1000 characters' });
 
-    // Step 1 — Dense semantic search
-    const denseResults = await multiQueryRetrieve(trimmed, 3, 5);
-    // Step 2 — Sparse BM25 search
-    const queryVocab = buildVocabulary([trimmed]);
-    const sparseVec = computeSparseVector(trimmed, queryVocab);
-    const sparseResults = await searchSparse(sparseVec, 10);
+    const results = await retrieve(trimmed);
 
-  //Step 3 — RRF fusion instead of raw score merge
-  const candidates = reciprocalRankFusion([denseResults, sparseResults])
-  .slice(0, 10);
-
-    // Step 4 — Rerank candidates with Cohere cross-encoder
-    const reranked = await rerank(trimmed, candidates, 4);
-
-    // Step 5 — Deduplicate by parentIndex
-    const seenParents = new Map();
-    for (const result of reranked) {
-      const pIdx = result.payload.parentIndex ?? result.payload.chunkIndex;
-      if (!seenParents.has(pIdx) || result.rerankScore > seenParents.get(pIdx).rerankScore) {
-        seenParents.set(pIdx, result);
-      }
+    if (results.length === 0) {
+      return res.status(200).json({
+        answer: 'I could not find relevant information to answer your question.',
+        sources: [],
+        retrieved: 0
+      });
     }
-    const dedupedResults = Array.from(seenParents.values());
 
-    // Step 6 — Build context from unique parents and generate answer
-    const context = dedupedResults
+    const context = results
       .map(r => r.payload.parentText || r.payload.text)
       .join('\n\n');
 
@@ -52,11 +35,11 @@ router.post('/', async (req, res) => {
 
     return res.status(200).json({
       answer,
-      retrieved: dedupedResults.length,
-      sources: dedupedResults.map(r => ({
+      retrieved: results.length,
+      sources: results.map(r => ({
         childText: r.payload.text,
         parentText: r.payload.parentText?.slice(0, 200) ?? null,
-        rerankScore: parseFloat(r.rerankScore?.toFixed(4) ?? 0),
+        rerankScore: parseFloat((r.rerankScore ?? r.rrfScore ?? 0).toFixed(4)),
         parentIndex: r.payload.parentIndex ?? null,
         source: r.payload.source ?? null
       }))
