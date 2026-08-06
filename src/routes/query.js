@@ -17,7 +17,8 @@ router.post('/', async (req, res) => {
     if (trimmed.length > 1000) return res.status(400).json({ error: 'question too long — max 1000 characters' });
 
     // Step 1 — Dense semantic search
-    const queryVec = await embed(trimmed);
+    const { hydeEmbed } = require('../hyde');
+    const queryVec = await hydeEmbed(trimmed);
     const denseResults = await searchDense(queryVec, 10);
 
     // Step 2 — Sparse BM25 search
