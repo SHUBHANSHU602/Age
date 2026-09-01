@@ -2,11 +2,12 @@ const express = require('express');
 const router = express.Router();
 const path = require('path');
 const fs = require('fs');
+const { randomUUID } = require('crypto');
 const { loadPDF } = require('../ingestion/pdfParser');
 const { parentChildChunk } = require('../ingestion/chunker');
 const { embedBatch } = require('../embedder');
 const { storeBatch } = require('../vectorStore');
-const { buildVocabulary, computeSparseVector } = require('../bm25');
+const { computeSparseVector } = require('../bm25');
 
 router.post('/', async (req, res) => {
   try {
@@ -16,7 +17,9 @@ router.post('/', async (req, res) => {
 
     const resolvedPath = path.resolve(filePath);
     if (!fs.existsSync(resolvedPath)) return res.status(400).json({ error: `File not found: ${resolvedPath}` });
-    if (!resolvedPath.endsWith('.pdf')) return res.status(400).json({ error: 'Only PDF files are supported' });
+    if (path.extname(resolvedPath).toLowerCase() !== '.pdf') {
+      return res.status(400).json({ error: 'Only PDF files are supported' });
+    }
 
     const docs = await loadPDF(resolvedPath);
     const chunks = await parentChildChunk(docs);
@@ -24,18 +27,17 @@ router.post('/', async (req, res) => {
 
     const texts = chunks.map(c => c.pageContent);
 
-    // Build vocabulary from all chunks so sparse vectors share the same term space
-    const vocabulary = buildVocabulary(texts);
-
-    // Dense embeddings — semantic meaning
+    // Dense embeddings — semantic meaning.
     const denseVectors = await embedBatch(texts);
 
-    const baseId = Math.floor(Math.random() * 1_000_000_000);
     const points = chunks.map((chunk, i) => ({
-      id: baseId + i,
+      // UUIDs avoid accidental overwrites across separate ingest requests.
+      id: randomUUID(),
       vector: {
         dense: denseVectors[i],
-        sparse: computeSparseVector(chunk.pageContent, vocabulary)
+        // Deterministic token hashing keeps sparse dimensions consistent
+        // across ingestion and query time.
+        sparse: computeSparseVector(chunk.pageContent)
       },
       payload: {
         text: chunk.pageContent,
@@ -49,7 +51,6 @@ router.post('/', async (req, res) => {
     await storeBatch(points);
 
     res.json({ status: 'ok', pages: docs.length, chunks: chunks.length, pointsStored: points.length });
-
   } catch (err) {
     console.error('[ingest error]', err.message);
     res.status(500).json({ error: err.message });
