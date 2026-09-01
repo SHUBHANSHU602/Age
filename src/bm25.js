@@ -1,6 +1,11 @@
-// Computes a sparse vector representation of text for BM25 keyword search.
-// Sparse vectors have indices (term IDs) and values (TF-IDF-like weights).
-// Only non-zero terms are stored — that's what makes them "sparse."
+// Sparse lexical vector generation for Qdrant.
+//
+// IMPORTANT: this is TF-normalized lexical weighting, not canonical BM25.
+// The previous implementation built a fresh vocabulary independently during
+// ingestion and query time, so the same token could map to different indices.
+// That made sparse retrieval incorrect. We now derive each token index from a
+// deterministic hash so the same token always maps to the same sparse dimension
+// across requests, documents, and server restarts.
 
 function tokenize(text) {
   return text
@@ -10,39 +15,39 @@ function tokenize(text) {
     .filter(t => t.length > 1);
 }
 
-function computeSparseVector(text, vocabulary) {
+// FNV-1a 32-bit hash. Qdrant sparse-vector indices are non-negative integers.
+function tokenToIndex(token) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < token.length; i++) {
+    hash ^= token.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+function computeSparseVector(text) {
   const tokens = tokenize(text);
-  const termFreq = {};
+  if (tokens.length === 0) return { indices: [], values: [] };
 
+  const termFreq = new Map();
   for (const token of tokens) {
-    termFreq[token] = (termFreq[token] || 0) + 1;
+    termFreq.set(token, (termFreq.get(token) || 0) + 1);
   }
 
-  const indices = [];
-  const values = [];
-
-  for (const [term, freq] of Object.entries(termFreq)) {
-    if (vocabulary.has(term)) {
-      indices.push(vocabulary.get(term));
-      // TF normalized by document length
-      values.push(freq / tokens.length);
-    }
+  // Hash collisions are rare but possible. Aggregate colliding token weights
+  // so Qdrant never receives duplicate indices in one sparse vector.
+  const weightsByIndex = new Map();
+  for (const [term, freq] of termFreq.entries()) {
+    const index = tokenToIndex(term);
+    const weight = freq / tokens.length;
+    weightsByIndex.set(index, (weightsByIndex.get(index) || 0) + weight);
   }
 
-  return { indices, values };
+  const entries = Array.from(weightsByIndex.entries()).sort((a, b) => a[0] - b[0]);
+  return {
+    indices: entries.map(([index]) => index),
+    values: entries.map(([, value]) => value)
+  };
 }
 
-function buildVocabulary(texts) {
-  const vocab = new Map();
-  let idx = 0;
-  for (const text of texts) {
-    for (const token of tokenize(text)) {
-      if (!vocab.has(token)) {
-        vocab.set(token, idx++);
-      }
-    }
-  }
-  return vocab;
-}
-
-module.exports = { tokenize, computeSparseVector, buildVocabulary };
+module.exports = { tokenize, tokenToIndex, computeSparseVector };
