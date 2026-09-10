@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
+    "graph:smoke": "node src/graph/smoke.js",
     "test": "node --test"
   },
   "keywords": ["rag", "langgraph", "qdrant", "groq", "crag", "self-rag"],
